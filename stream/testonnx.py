@@ -149,6 +149,9 @@ class CCM(nn.Module):
     import onnx
     import onnxruntime
     from onnxsim import simplify
+    import soundfile as sf
+    from scipy import signal  # 用于STFT计算
+    
 ## run onnx model
     file = 'onnx_models/deepvqe_simple.onnx'
     # session = onnxruntime.InferenceSession(file, None, providers=['CPUExecutionProvider'])
@@ -176,19 +179,45 @@ class CCM(nn.Module):
     de_conv_cache1 = np.zeros([1,64,3,129], dtype="float32")
     m_cache        = np.zeros([1,257,2,2],  dtype="float32")
 
+    # 读取WAV文件
+    audio_path = '../test.wav'  # 替换为您的WAV文件路径
+    x, fs = sf.read(audio_path, dtype='float32')  # x: (n_samples,), 单声道, 16 kHz
+
+    # 计算STFT
+    n_fft = 512
+    hop_length = 256
+    f, t, Zxx = signal.stft(x, fs, nperseg=n_fft, noverlap=n_fft-hop_length, window='hann')
+
+    # 将复数STFT结果转换为实部和虚部分开的格式
+    stft_real = np.real(Zxx)
+    stft_imag = np.imag(Zxx)
+
+    # 组合为模型输入格式 (1, F, T, 2)
+    stft_input = np.stack([stft_real, stft_imag], axis=-1)
+    stft_input = np.expand_dims(stft_input, axis=0)  # 添加批次维度
+
+    # 确保频率维度正确 (应该是257)
+    if stft_input.shape[1] != 257:
+        # 如果频率维度不正确，可能需要调整
+        print(f"警告: STFT频率维度为{stft_input.shape[1]}，但期望为257")
+        # 这里可以根据需要进行截断或填充
+
     T_list = []
     outputs = []
-    device = "cpu"
-    batch = torch.randn(1, 257, 100, 2, device=device)
-    inputs = batch.numpy() 
-    for i in range(inputs.shape[-2]):
+
+    # 处理每一帧
+    for i in range(stft_input.shape[2]):  # 遍历时间维度
         tic = time.perf_counter()
         
-        out_i,  en_conv_cache1, en_res_cache1, en_conv_cache2, en_res_cache2, en_conv_cache3, en_res_cache3,\
+        # 提取当前帧 (保持形状为 [1, 257, 1, 2])
+        current_frame = stft_input[:, :, i:i+1, :]
+        
+        # 运行ONNX模型
+        out_i, en_conv_cache1, en_res_cache1, en_conv_cache2, en_res_cache2, en_conv_cache3, en_res_cache3,\
                 en_conv_cache4, en_res_cache4, en_conv_cache5, en_res_cache5,\
                 h_cache, de_conv_cache5, de_res_cache5, de_conv_cache4, de_res_cache4, de_conv_cache3, de_res_cache3,\
                 de_conv_cache2, de_res_cache2, de_conv_cache1, de_res_cache1, m_cache\
-                = session.run([], {'mix': inputs[..., i:i+1, :],
+                = session.run([], {'mix': current_frame,
                     'en_conv_cache1': en_conv_cache1, 'en_res_cache1': en_res_cache1, 
                     'en_conv_cache2': en_conv_cache2, 'en_res_cache2': en_res_cache2, 
                     'en_conv_cache3': en_conv_cache3, 'en_res_cache3': en_res_cache3,
@@ -208,5 +237,23 @@ class CCM(nn.Module):
 
     print(">>> inference time: mean: {:.1f}ms, max: {:.1f}ms, min: {:.1f}ms".format(1e3*np.mean(T_list), 1e3*np.max(T_list), 1e3*np.min(T_list)))
 
-    outputs = np.concatenate(outputs, axis=-2)
-    #print(">>> Onnx error:", np.abs(output.detach().cpu().numpy() - outputs).max())
+    # 将所有输出帧拼接起来
+    outputs = np.concatenate(outputs, axis=-2)  # 形状: (1, 257, T, 2)
+
+    # 将输出转换为复数形式
+    output_real = outputs[0, :, :, 0]  # 实部
+    output_imag = outputs[0, :, :, 1]  # 虚部
+    output_complex = output_real + 1j * output_imag
+
+    # 计算ISTFT以重建时域信号
+    t, enhanced_audio = signal.istft(output_complex, fs, nperseg=n_fft, noverlap=n_fft-hop_length, window='hann')
+
+    # 确保长度与原始音频相同
+    if len(enhanced_audio) > len(x):
+        enhanced_audio = enhanced_audio[:len(x)]
+    elif len(enhanced_audio) < len(x):
+        enhanced_audio = np.pad(enhanced_audio, (0, len(x) - len(enhanced_audio)))
+
+    # 保存增强后的音频
+    sf.write('test_enhanced.wav', enhanced_audio, fs)
+    print("增强后的音频已保存为 'test_enhanced.wav'")
