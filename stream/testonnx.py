@@ -1,0 +1,212 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from einops import rearrange
+from modules.convolution import StreamConv2d
+from modules.convert import convert_to_stream
+
+
+class FE(nn.Module):
+    """Feature extraction"""
+    def __init__(self, c=0.3):
+        super().__init__()
+        self.c = c
+    def forward(self, x):
+        """x: (B,F,1,2)"""
+        x_mag = torch.sqrt(x[...,[0]]**2 + x[...,[1]]**2 + 1e-12)
+        x_c = torch.div(x, x_mag.pow(1-self.c) + 1e-12)  # (B,F,T,2)
+        return x_c.permute(0,3,2,1).contiguous()
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = StreamConv2d(channels, channels, kernel_size=(4,3), padding=(0,1))
+        self.bn = nn.BatchNorm2d(channels)
+        self.elu = nn.ELU()
+    def forward(self, x, cache):
+        """
+        x: (B,C,1,F)
+        cache: (B,C,3,F)
+        """
+        y, cache = self.conv(x, cache)
+        y = self.elu(self.bn(y))
+        return y + x, cache
+    
+
+class EncoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=(4,3), stride=(1,2)):
+        super().__init__()
+        self.conv = StreamConv2d(in_channels, out_channels, kernel_size, stride=stride, padding=(0,1))
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.elu = nn.ELU()
+        self.resblock = ResidualBlock(out_channels)
+    def forward(self, x, conv_cache, res_cache):
+        """
+        x: (B,C,1,F)
+        conv_cache: (B,Ci,3,Fi)
+        res_cache:  (B,Co,3,Fo)
+        """
+        x, conv_cache = self.conv(x, conv_cache)
+        x = self.elu(self.bn(x))
+        x, res_cache = self.resblock(x, res_cache)
+        return x, conv_cache, res_cache
+
+
+class Bottleneck(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.gru = nn.GRU(input_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, input_size)
+        
+    def forward(self, x, cache):
+        """x : (B,C,1,F)"""
+        y = rearrange(x, 'b c t f -> b t (c f)')
+        y, cache = self.gru(y, cache)
+        y = self.fc(y)
+        y = rearrange(y, 'b t (c f) -> b c t f', f=x.shape[-1])
+        return y, cache
+    
+
+class SubpixelConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=(4,3)):
+        super().__init__()
+        self.conv = StreamConv2d(in_channels, out_channels*2, kernel_size, padding=(0,1))
+        
+    def forward(self, x, cache):
+        """
+        x: (B,C,1,F)
+        cache: (B,C,3,F)
+        """
+        y, cache = self.conv(x, cache)
+        y = rearrange(y, 'b (r c) t f -> b c t (r f)', r=2)
+        return y, cache
+    
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=(4,3), is_last=False):
+        super().__init__()
+        self.skip_conv = nn.Conv2d(in_channels, in_channels, 1)
+        self.resblock = ResidualBlock(in_channels)
+        self.deconv = SubpixelConv2d(in_channels, out_channels, kernel_size)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.elu = nn.ELU()
+        self.is_last = is_last
+    def forward(self, x, x_en, conv_cache, res_cache):
+        """
+        x: (B,C,1,F)
+        x_en: (B,C,1,F)
+        conv_cache: (B,Ci,2,Fi)
+        res_cache: (B,Ci,2,Fi)
+        """
+        y = x + self.skip_conv(x_en)
+        y, res_cache = self.resblock(y, res_cache)
+        y, conv_cache = self.deconv(y, conv_cache)
+        if not self.is_last:
+            y = self.elu(self.bn(y))
+        return y, conv_cache, res_cache
+    
+
+class CCM(nn.Module):
+    """Complex convolving mask block"""
+    def __init__(self):
+        super().__init__()
+        # self.v = torch.tensor([1, -1/2 + 1j*np.sqrt(3)/2, -1/2 - 1j*np.sqrt(3)/2], dtype=torch.complex64)
+        self.v = torch.tensor([[1,        -1/2,           -1/2],
+                               [0, np.sqrt(3)/2, -np.sqrt(3)/2]], dtype=torch.float32)  # (2,3)
+        self.unfold = nn.Unfold(kernel_size=(3,3), padding=(0,1))
+    
+    def forward(self, m, x, cache):
+        """
+        m: (B,27,1,F)
+        x: (B,F,1,2)
+        cache: (B,F,2,2)
+        """
+        m = m.view(1, 3, 9, 1, 257)
+        H_real = torch.sum(self.v[0].to(m.device)[None,:,None,None,None] * m, dim=1)  # (B,C/3,T,F)
+        H_imag = torch.sum(self.v[1].to(m.device)[None,:,None,None,None] * m, dim=1)  # (B,C/3,T,F)
+        
+        M_real = H_real.view(1, 3, 3, 1, 257)
+        M_imag = H_imag.view(1, 3, 3, 1, 257)
+        
+        x = torch.cat([cache, x], dim=2)     # (B,F,T,2)
+        cache = x[:,:,1:]                    # (B,F,2,2)
+        x = x.permute(0,3,2,1).contiguous()  # (B,2,T,F)
+
+        x_unfold = self.unfold(x)
+        x_unfold = x_unfold.view(1, 2, 3, 3, 1, 257)
+        
+        x_enh_real = torch.sum(M_real * x_unfold[:,0] - M_imag * x_unfold[:,1], dim=(1,2))  # (B,T,F)
+        x_enh_imag = torch.sum(M_real * x_unfold[:,1] + M_imag * x_unfold[:,0], dim=(1,2))  # (B,T,F)
+        x_enh = torch.stack([x_enh_real, x_enh_imag], dim=3).transpose(1,2).contiguous()
+
+        return x_enh, cache
+        
+        
+        
+    """ONNX模型"""
+    import time
+    import onnx
+    import onnxruntime
+    from onnxsim import simplify
+## run onnx model
+    file = 'onnx_models/deepvqe_simple.onnx'
+    # session = onnxruntime.InferenceSession(file, None, providers=['CPUExecutionProvider'])
+    session = onnxruntime.InferenceSession(file, None, providers=['CPUExecutionProvider'])
+    en_conv_cache1 = np.zeros([1,2,3,257],  dtype="float32")
+    en_res_cache1  = np.zeros([1,64,3,129], dtype="float32")
+    en_conv_cache2 = np.zeros([1,64,3,129], dtype="float32")
+    en_res_cache2  = np.zeros([1,128,3,65], dtype="float32")
+    en_conv_cache3 = np.zeros([1,128,3,65], dtype="float32")
+    en_res_cache3  = np.zeros([1,128,3,33], dtype="float32")
+    en_conv_cache4 = np.zeros([1,128,3,33], dtype="float32")
+    en_res_cache4  = np.zeros([1,128,3,17], dtype="float32")
+    en_conv_cache5 = np.zeros([1,128,3,17], dtype="float32")
+    en_res_cache5  = np.zeros([1,128,3,9 ], dtype="float32")
+    h_cache        = np.zeros([1,1,64*9  ], dtype="float32")
+    de_res_cache5  = np.zeros([1,128,3,9 ], dtype="float32")
+    de_conv_cache5 = np.zeros([1,128,3,9 ], dtype="float32")
+    de_res_cache4  = np.zeros([1,128,3,17], dtype="float32")
+    de_conv_cache4 = np.zeros([1,128,3,17], dtype="float32")
+    de_res_cache3  = np.zeros([1,128,3,33], dtype="float32")
+    de_conv_cache3 = np.zeros([1,128,3,33], dtype="float32")
+    de_res_cache2  = np.zeros([1,128,3,65], dtype="float32")
+    de_conv_cache2 = np.zeros([1,128,3,65], dtype="float32")
+    de_res_cache1  = np.zeros([1,64,3,129], dtype="float32")
+    de_conv_cache1 = np.zeros([1,64,3,129], dtype="float32")
+    m_cache        = np.zeros([1,257,2,2],  dtype="float32")
+
+    T_list = []
+    outputs = []
+    device = "cpu"
+    batch = torch.randn(1, 257, 100, 2, device=device)
+    inputs = batch.numpy() 
+    for i in range(inputs.shape[-2]):
+        tic = time.perf_counter()
+        
+        out_i,  en_conv_cache1, en_res_cache1, en_conv_cache2, en_res_cache2, en_conv_cache3, en_res_cache3,\
+                en_conv_cache4, en_res_cache4, en_conv_cache5, en_res_cache5,\
+                h_cache, de_conv_cache5, de_res_cache5, de_conv_cache4, de_res_cache4, de_conv_cache3, de_res_cache3,\
+                de_conv_cache2, de_res_cache2, de_conv_cache1, de_res_cache1, m_cache\
+                = session.run([], {'mix': inputs[..., i:i+1, :],
+                    'en_conv_cache1': en_conv_cache1, 'en_res_cache1': en_res_cache1, 
+                    'en_conv_cache2': en_conv_cache2, 'en_res_cache2': en_res_cache2, 
+                    'en_conv_cache3': en_conv_cache3, 'en_res_cache3': en_res_cache3,
+                    'en_conv_cache4': en_conv_cache4, 'en_res_cache4': en_res_cache4, 
+                    'en_conv_cache5': en_conv_cache5, 'en_res_cache5': en_res_cache5,
+                    'h_cache': h_cache, 
+                    'de_conv_cache5': de_conv_cache5, 'de_res_cache5': de_res_cache5, 
+                    'de_conv_cache4': de_conv_cache4, 'de_res_cache4': de_res_cache4, 
+                    'de_conv_cache3': de_conv_cache3, 'de_res_cache3': de_res_cache3,
+                    'de_conv_cache2': de_conv_cache2, 'de_res_cache2': de_res_cache2, 
+                    'de_conv_cache1': de_conv_cache1, 'de_res_cache1': de_res_cache1,
+                    'm_cache': m_cache})
+
+        toc = time.perf_counter()
+        T_list.append(toc-tic)
+        outputs.append(out_i)
+
+    print(">>> inference time: mean: {:.1f}ms, max: {:.1f}ms, min: {:.1f}ms".format(1e3*np.mean(T_list), 1e3*np.max(T_list), 1e3*np.min(T_list)))
+
+    outputs = np.concatenate(outputs, axis=-2)
+    #print(">>> Onnx error:", np.abs(output.detach().cpu().numpy() - outputs).max())
